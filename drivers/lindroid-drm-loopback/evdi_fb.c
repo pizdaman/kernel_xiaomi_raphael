@@ -2,213 +2,320 @@
 /*
  * Copyright (C) 2012 Red Hat
  * Copyright (c) 2015 - 2020 DisplayLink (UK) Ltd.
- * Copyright (c) 2025 Lindroid Authors
+ *
+ * Based on parts on udlfb.c:
+ * Copyright (C) 2009 its respective authors
  *
  * This file is subject to the terms and conditions of the GNU General Public
  * License v2. See the file COPYING in the main directory of this archive for
  * more details.
  */
 
-#include "evdi_drv.h"
-#include <drm/drm_file.h>
-#include <drm/drm_framebuffer.h>
-#include <drm/drm_fourcc.h>
-#include <drm/drm_gem.h>
-#include <linux/overflow.h>
-#include <linux/file.h>
-
-static inline void evdi_gem_object_put_local(struct drm_gem_object *obj)
-{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-	drm_gem_object_put(obj);
+#include <linux/slab.h>
+#include <linux/dma-buf.h>
+#include <linux/version.h>
+#if KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE || defined(EL8)
 #else
-	drm_gem_object_put_unlocked(obj);
+#include <drm/drmP.h>
 #endif
+#include <drm/drm_crtc.h>
+#include <drm/drm_crtc_helper.h>
+#include <drm/drm_fb_helper.h>
+#include <drm/drm_atomic.h>
+#if KERNEL_VERSION(5, 0, 0) <= LINUX_VERSION_CODE || defined(EL8)
+#include <drm/drm_damage_helper.h>
+#endif
+#include "evdi_drm_drv.h"
+
+
+struct evdi_fbdev {
+	struct drm_fb_helper helper;
+	struct evdi_framebuffer efb;
+	struct list_head fbdev_list;
+	const struct fb_ops *fb_ops;
+	int fb_count;
+};
+
+struct drm_clip_rect evdi_framebuffer_sanitize_rect(
+				const struct evdi_framebuffer *fb,
+				const struct drm_clip_rect *dirty_rect)
+{
+	struct drm_clip_rect rect = *dirty_rect;
+
+	if (rect.x1 > rect.x2) {
+		unsigned short tmp = rect.x2;
+
+		EVDI_WARN("Wrong clip rect: x1 > x2\n");
+		rect.x2 = rect.x1;
+		rect.x1 = tmp;
+	}
+
+	if (rect.y1 > rect.y2) {
+		unsigned short tmp = rect.y2;
+
+		EVDI_WARN("Wrong clip rect: y1 > y2\n");
+		rect.y2 = rect.y1;
+		rect.y1 = tmp;
+	}
+
+
+	if (rect.x1 > fb->base.width) {
+		EVDI_DEBUG("Wrong clip rect: x1 > fb.width\n");
+		rect.x1 = fb->base.width;
+	}
+
+	if (rect.y1 > fb->base.height) {
+		EVDI_DEBUG("Wrong clip rect: y1 > fb.height\n");
+		rect.y1 = fb->base.height;
+	}
+
+	if (rect.x2 > fb->base.width) {
+		EVDI_DEBUG("Wrong clip rect: x2 > fb.width\n");
+		rect.x2 = fb->base.width;
+	}
+
+	if (rect.y2 > fb->base.height) {
+		EVDI_DEBUG("Wrong clip rect: y2 > fb.height\n");
+		rect.y2 = fb->base.height;
+	}
+
+	return rect;
 }
 
-static void evdi_fb_destroy(struct drm_framebuffer *fb)
+#if KERNEL_VERSION(5, 0, 0) <= LINUX_VERSION_CODE || defined(EL8)
+#else
+/*
+ * Function taken from
+ * https://lore.kernel.org/dri-devel/20180905233901.2321-5-drawat@vmware.com/
+ */
+static int evdi_user_framebuffer_dirty(
+		struct drm_framebuffer *fb,
+		__maybe_unused struct drm_file *file_priv,
+		__always_unused unsigned int flags,
+		__always_unused unsigned int color,
+		__always_unused struct drm_clip_rect *clips,
+		__always_unused unsigned int num_clips)
 {
 	struct evdi_framebuffer *efb = to_evdi_fb(fb);
-	struct evdi_device *evdi = fb->dev ? fb->dev->dev_private : NULL;
+	struct drm_device *dev = efb->base.dev;
+	struct evdi_device *evdi = dev->dev_private;
 
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_atomic_state *state;
+	struct drm_plane *plane;
+	int ret = 0;
+	unsigned int i;
+
+	EVDI_CHECKPT();
+
+	drm_modeset_acquire_init(&ctx,
+		/*
+		 * When called from ioctl, we are interruptable,
+		 * but not when called internally (ie. defio worker)
+		 */
+		file_priv ? DRM_MODESET_ACQUIRE_INTERRUPTIBLE :	0);
+
+	state = drm_atomic_state_alloc(fb->dev);
+	if (!state) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	state->acquire_ctx = &ctx;
+
+	for (i = 0; i < num_clips; ++i)
+		evdi_painter_mark_dirty(evdi, &clips[i]);
+
+retry:
+
+	drm_for_each_plane(plane, fb->dev) {
+		struct drm_plane_state *plane_state;
+
+		if (plane->state->fb != fb)
+			continue;
+
+		/*
+		 * Even if it says 'get state' this function will create and
+		 * initialize state if it does not exists. We use this property
+		 * to force create state.
+		 */
+		plane_state = drm_atomic_get_plane_state(state, plane);
+		if (IS_ERR(plane_state)) {
+			ret = PTR_ERR(plane_state);
+			goto out;
+		}
+	}
+
+	ret = drm_atomic_commit(state);
+
+out:
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		ret = drm_modeset_backoff(&ctx);
+		if (!ret)
+			goto retry;
+	}
+
+	if (state)
+		drm_atomic_state_put(state);
+
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+
+	return ret;
+}
+#endif
+
+static int evdi_user_framebuffer_create_handle(struct drm_framebuffer *fb,
+					       struct drm_file *file_priv,
+					       unsigned int *handle)
+{
+	struct evdi_framebuffer *efb = to_evdi_fb(fb);
+
+	return drm_gem_handle_create(file_priv, &efb->obj->base, handle);
+}
+
+static void evdi_user_framebuffer_destroy(struct drm_framebuffer *fb)
+{
+	struct evdi_framebuffer *efb = to_evdi_fb(fb);
+	struct drm_device *dev = efb->base.dev;
+	struct evdi_device *evdi = dev->dev_private;
+	int ret;
+	EVDI_CHECKPT();
 	if (efb->obj)
-		evdi_gem_object_put_local(&efb->obj->base);
-
+#if KERNEL_VERSION(5, 9, 0) <= LINUX_VERSION_CODE || defined(EL8)
+		drm_gem_object_put(&efb->obj->base);
+#else
+		drm_gem_object_put_unlocked(&efb->obj->base);
+#endif
 	drm_framebuffer_cleanup(fb);
 
-	if (evdi && efb->gralloc_buf_id)
-		evdi_queue_destroy_event(evdi, efb->gralloc_buf_id, efb->owner);
+	struct evdi_event *event = evdi_create_event(evdi, destroy_buf, &efb->gralloc_buf_id);
+	if (!event)
+		return;
+
+	wake_up(&evdi->poll_ioct_wq);
+	ret = wait_event_interruptible(event->wait, event->completed);
+	if (ret < 0) {
+		printk("evdi_gbm_add_buf_ioctl: wait_event_interruptible interrupted: %d\n", ret);
+		return;
+	}
+
+	ret = event->result;
+	if (ret < 0) {
+		pr_err("evdi_gbm_add_buf_ioctl: user ioctl failled\n");
+		return;
+	}
+
+	mutex_lock(&evdi->event_lock);
+	idr_remove(&evdi->event_idr, event->poll_id);
+	mutex_unlock(&evdi->event_lock);
+	kfree(event);
 
 	kfree(efb);
 }
 
-static int evdi_fb_create_handle(struct drm_framebuffer *fb,
-				 struct drm_file *file,
-				 unsigned int *handle)
-{
-	struct evdi_framebuffer *efb = to_evdi_fb(fb);
-	if (!efb->obj)
-		return -EINVAL;
-	return drm_gem_handle_create(file, &efb->obj->base, handle);
-}
+	int evdi_atomic_helper_dirtyfb(struct drm_framebuffer *framebuffer,
+		     struct drm_file *file_priv, unsigned flags,
+		     unsigned color, struct drm_clip_rect *clips,
+		     unsigned num_clips){
+				 return 0;
+			}
 
-const struct drm_framebuffer_funcs evdifb_funcs = {
-	.destroy	= evdi_fb_destroy,
-	.create_handle	= evdi_fb_create_handle,
+static const struct drm_framebuffer_funcs evdifb_funcs = {
+	.create_handle = evdi_user_framebuffer_create_handle,
+	.destroy = evdi_user_framebuffer_destroy,
+#if KERNEL_VERSION(5, 0, 0) <= LINUX_VERSION_CODE || defined(EL8)
+	.dirty = evdi_atomic_helper_dirtyfb,
+#else
+	.dirty = evdi_user_framebuffer_dirty,
+#endif
 };
 
-static unsigned int evdi_fb_cpp(u32 format)
+static int
+evdi_framebuffer_init(struct drm_device *dev,
+		      struct evdi_framebuffer *efb,
+		      const struct drm_mode_fb_cmd2 *mode_cmd,
+		      struct evdi_gem_object *obj)
+{
+	efb->obj = obj;
+	drm_helper_mode_fill_fb_struct(dev, &efb->base, mode_cmd);
+	return drm_framebuffer_init(dev, &efb->base, &evdifb_funcs);
+}
+
+int evdi_fb_get_bpp(uint32_t format)
 {
 	const struct drm_format_info *info = drm_format_info(format);
-	if (!info || info->num_planes != 1)
-		return 0;
-
-	return info->cpp[0];
-}
-
-static int evdi_fb_calc_size(const struct drm_mode_fb_cmd2 *mode_cmd,
-			     u32 *out_pitch, size_t *out_size)
-{
-	const struct drm_format_info *info = drm_format_info(mode_cmd->pixel_format);
-	u32 pitch, cpp;
-	size_t last_lines, total, tail;
-
-	if (!info || info->num_planes != 1)
-		return -EINVAL;
-
-	cpp = info->cpp[0];
-	if (!cpp)
-		return -EINVAL;
-
-	if (!mode_cmd->width || !mode_cmd->height)
-		return -EINVAL;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0))
-	if (mode_cmd->modifier[0] && mode_cmd->modifier[0] != DRM_FORMAT_MOD_LINEAR)
-		return -EINVAL;
-#endif
-
-	if (mode_cmd->pitches[0]) {
-		pitch = mode_cmd->pitches[0];
-		if (pitch < mode_cmd->width * cpp)
-			return -EINVAL;
-	} else {
-		pitch = mode_cmd->width * cpp;
-	}
-
-	if (mode_cmd->height == 0)
-		return -EINVAL;
-
-	if (check_mul_overflow((size_t)(mode_cmd->height - 1), (size_t)pitch, &last_lines))
-		return -EOVERFLOW;
-
-	tail = (size_t)mode_cmd->width * cpp;
-	if (check_add_overflow((size_t)mode_cmd->offsets[0], last_lines, &total))
-		return -EOVERFLOW;
-
-	if (check_add_overflow(total, tail, &total))
-		return -EOVERFLOW;
-
-	*out_pitch = pitch;
-	*out_size = total;
-	return 0;
-}
-
-static int evdi_fb_extract_gralloc_id(const struct drm_mode_fb_cmd2 *mode_cmd)
-{
-#if (KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE)
-	if (mode_cmd->modifier[0])
-		return (int)(mode_cmd->modifier[0] & 0x7fffffff);
-#endif
-	if (mode_cmd->handles[0] > 0xFFFF)
-		return (int)mode_cmd->handles[0];
-
-	return 0;
-}
-
-static struct evdi_gem_object *evdi_fb_acquire_bo(struct drm_device *dev,
-						  struct drm_file *file,
-						  const struct drm_mode_fb_cmd2 *mode_cmd)
-{
-	size_t size;
-	u32 validated_pitch;
-	int ret;
-
-	ret = evdi_fb_calc_size(mode_cmd, &validated_pitch, &size);
-	if (ret)
-		return NULL;
-
-	return evdi_gem_alloc_object(dev, size);
-}
-
-static int evdi_fb_init_core(struct drm_device *dev,
-			     struct evdi_framebuffer *efb,
-			     const struct drm_mode_fb_cmd2 *mode_cmd)
-{
-	struct drm_framebuffer *fb = &efb->base;
-	const struct drm_format_info *info = drm_format_info(mode_cmd->pixel_format);
-	int ret;
 
 	if (!info)
-		return -EINVAL;
-
-	fb->dev = dev;
-	fb->format = info;
-	fb->width  = mode_cmd->width;
-	fb->height = mode_cmd->height;
-	fb->pitches[0] = mode_cmd->pitches[0] ?
-			 mode_cmd->pitches[0] :
-			 evdi_fb_cpp(mode_cmd->pixel_format) * mode_cmd->width;
-	fb->offsets[0] = mode_cmd->offsets[0];
-#if defined(DRM_FORMAT_MOD_LINEAR) || (LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0))
-	fb->modifier = mode_cmd->modifier[0];
-#endif
-	fb->flags = 0;
-	fb->funcs = &evdifb_funcs;
-	fb->obj[0] = &efb->obj->base;
-
-	ret = drm_framebuffer_init(dev, fb, &evdifb_funcs);
-	return ret;
+		return 0;
+	return info->cpp[0] * 8;
 }
 
-struct drm_framebuffer *evdi_fb_user_fb_create(struct drm_device *dev,
-					       struct drm_file *file,
-					       const struct drm_mode_fb_cmd2 *mode_cmd)
+struct drm_framebuffer *evdi_fb_user_fb_create(
+					struct drm_device *dev,
+					struct drm_file *file,
+					const struct drm_mode_fb_cmd2 *mode_cmd)
 {
+	struct drm_gem_object *obj;
 	struct evdi_framebuffer *efb;
-	struct evdi_gem_object *bo;
-	int ret, id = 0;
-	struct file *memfd_file;
-	loff_t pos = 0;
+	int ret;
+	uint32_t size;
+	int bpp = evdi_fb_get_bpp(mode_cmd->pixel_format);
+	uint32_t handle;
 	ssize_t bytes_read;
+	struct evdi_device *evdi = dev->dev_private;
 
-	bo = evdi_fb_acquire_bo(dev, file, mode_cmd);
-	if (!bo)
+	size = mode_cmd->offsets[0] + mode_cmd->pitches[0] * mode_cmd->height;
+	size = ALIGN(size, PAGE_SIZE);
+
+	if (bpp != 32) {
+		EVDI_ERROR("Unsupported bpp (%d)\n", bpp);
+		return ERR_PTR(-EINVAL);
+	}
+
+	evdi_gem_create(file, dev, size, &handle);
+	obj = drm_gem_object_lookup(file, handle);
+	if (obj == NULL)
 		return ERR_PTR(-ENOENT);
-
+	if (size > obj->size) {
+		DRM_ERROR("object size not sufficient for fb %d %zu %u %d %d\n",
+			  size, obj->size, mode_cmd->offsets[0],
+			  mode_cmd->pitches[0], mode_cmd->height);
+		goto err_no_mem;
+	}
 	efb = kzalloc(sizeof(*efb), GFP_KERNEL);
-	if (!efb) {
-		evdi_gem_object_put_local(&bo->base);
-		return ERR_PTR(-ENOMEM);
-	}
+	if (efb == NULL)
+		goto err_no_mem;
+	efb->base.obj[0] = obj;
 
-	efb->obj = bo;
-	efb->owner = file;
-	efb->active = true;
+	struct file *memfd_file;
+	int id;
+
 	memfd_file = fget(mode_cmd->handles[0]);
-	if (memfd_file) {
-		bytes_read = kernel_read(memfd_file, &id, sizeof(id), &pos);
-		if (bytes_read == sizeof(id))
-			efb->gralloc_buf_id = id;
+	if (!memfd_file) {
+		printk("Failed to open fake fb: %d\n", mode_cmd->handles[0]);
+		return ERR_PTR(-EINVAL);
 	}
-	if (!efb->gralloc_buf_id)
-		efb->gralloc_buf_id = evdi_fb_extract_gralloc_id(mode_cmd);
 
-	ret = evdi_fb_init_core(dev, efb, mode_cmd);
-	if (ret) {
-		evdi_gem_object_put_local(&bo->base);
-		kfree(efb);
-		return ERR_PTR(ret);
+	loff_t pos = 0;
+	bytes_read = kernel_read(memfd_file, &id, sizeof(id), &pos);
+	if (bytes_read != sizeof(id)) {
+		printk("Failed to read id from memfd, bytes_read=%zd\n", bytes_read);
+		return ERR_PTR(-EIO);
 	}
+
+	efb->gralloc_buf_id = id;
+	ret = evdi_framebuffer_init(dev, efb, mode_cmd, to_evdi_bo(obj));
+
+	if (ret)
+		goto err_inval;
 	return &efb->base;
+
+ err_no_mem:
+	drm_gem_object_put(obj);
+	return ERR_PTR(-ENOMEM);
+ err_inval:
+	kfree(efb);
+	drm_gem_object_put(obj);
+	return ERR_PTR(-EINVAL);
 }
